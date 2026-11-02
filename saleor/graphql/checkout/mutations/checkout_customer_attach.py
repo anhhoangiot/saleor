@@ -78,15 +78,6 @@ class CheckoutCustomerAttach(BaseMutation):
     ):
         checkout = get_checkout(cls, info, checkout_id=checkout_id, token=token, id=id)
 
-        # Raise error when trying to attach a user to a checkout
-        # that is already owned by another user.
-        if checkout.user_id:
-            raise PermissionDenied(
-                message=(
-                    "You cannot reassign a checkout that is already attached to a user."
-                )
-            )
-
         user_id_from_request = None
         if user := info.context.user:
             user_id_from_request = graphene.Node.to_global_id("User", user.id)
@@ -112,6 +103,23 @@ class CheckoutCustomerAttach(BaseMutation):
             )
         else:
             customer = info.context.user
+
+        # The checkout already has an owner: re-attaching the same customer is
+        # a no-op; a different customer cannot be attached.
+        if checkout.user_id:
+            if checkout.user_id == customer.pk:
+                return CheckoutCustomerAttach(
+                    checkout=SyncWebhookControlContext(node=checkout)
+                )
+            raise ValidationError(
+                {
+                    "customer_id": ValidationError(
+                        "You cannot reassign a checkout that is already attached "
+                        "to a user.",
+                        code=CheckoutErrorCode.CUSTOMER_ASSOCIATED.value,
+                    )
+                }
+            )
 
         checkout.user = customer
         checkout.email = customer.email
