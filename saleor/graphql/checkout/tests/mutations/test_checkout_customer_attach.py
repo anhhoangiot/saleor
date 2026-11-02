@@ -236,41 +236,6 @@ def test_checkout_customer_attach_by_app_without_permission(
     assert_no_permission(response)
 
 
-def test_checkout_customer_attach_user_to_checkout_with_user(
-    user_api_client, customer_user, user_checkout, address
-):
-    checkout = user_checkout
-
-    query = """
-    mutation checkoutCustomerAttach($id: ID) {
-        checkoutCustomerAttach(id: $id) {
-            checkout {
-                token
-            }
-            errors {
-                field
-                message
-                code
-            }
-        }
-    }
-"""
-
-    default_address = address.get_copy()
-    second_user = dangerously_create_test_user(
-        "test2@example.com",
-        "password",
-        default_billing_address=default_address,
-        default_shipping_address=default_address,
-        first_name="Test2",
-        last_name="Tested",
-    )
-
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-    customer_id = graphene.Node.to_global_id("User", second_user.pk)
-    variables = {"id": checkout_id, "customerId": customer_id}
-    response = user_api_client.post_graphql(query, variables)
-    assert_no_permission(response)
 
 
 def test_with_active_problems_flow(user_api_client, checkout_with_problems):
@@ -423,3 +388,67 @@ def test_checkout_customer_attach_do_not_mark_shipping_as_stale(
     assert data["checkout"]["email"] == customer_user2.email
     checkout.refresh_from_db()
     assert checkout.delivery_methods_stale_at == expected_stale_time
+
+
+def test_checkout_customer_attach_same_customer_again(
+    user_api_client, user_checkout
+):
+    # given
+    checkout = user_checkout
+    customer = checkout.user
+    previous_last_change = checkout.last_change
+    checkout.search_index_dirty = False
+    checkout.save(update_fields=["search_index_dirty"])
+
+    query = MUTATION_CHECKOUT_CUSTOMER_ATTACH
+    variables = {"id": to_global_id_or_none(checkout)}
+
+    # when
+    response = user_api_client.post_graphql(query, variables)
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["checkoutCustomerAttach"]
+    assert not data["errors"]
+    assert data["checkout"]["token"] == str(checkout.token)
+    checkout.refresh_from_db()
+    assert checkout.user == customer
+    assert checkout.last_change == previous_last_change
+    assert checkout.search_index_dirty is False
+
+
+def test_checkout_customer_attach_different_customer_to_checkout_with_user(
+    user_api_client, customer_user, user_checkout, permission_impersonate_user
+):
+    # given
+    checkout = user_checkout
+    second_user = dangerously_create_test_user(
+        "different-customer@example.com",
+        "password",
+        first_name="Different",
+        last_name="Customer",
+    )
+
+    query = MUTATION_CHECKOUT_CUSTOMER_ATTACH
+    customer_id = graphene.Node.to_global_id("User", second_user.pk)
+    variables = {"id": to_global_id_or_none(checkout), "customerId": customer_id}
+
+    # when: the caller has IMPERSONATE_USER and can resolve the target
+    # customer, but the checkout is already owned by a different user.
+    response = user_api_client.post_graphql(
+        query, variables, permissions=[permission_impersonate_user]
+    )
+    content = get_graphql_content(response)
+
+    # then
+    data = content["data"]["checkoutCustomerAttach"]
+    errors = data["errors"]
+    assert len(errors) == 1
+    assert errors[0]["code"] == CheckoutErrorCode.CUSTOMER_ASSOCIATED.name
+    assert errors[0]["field"] == "customerId"
+    assert errors[0]["message"] == (
+        "You cannot reassign a checkout that is already attached to a user."
+    )
+    checkout.refresh_from_db()
+    assert checkout.user == customer_user
+    assert data["checkout"] is None
