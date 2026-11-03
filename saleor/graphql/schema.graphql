@@ -31528,6 +31528,7 @@ type CheckoutError @doc(category: "Checkout") {
 }
 
 enum CheckoutErrorCode @doc(category: "Checkout") {
+  ALREADY_ATTACHED
   BILLING_ADDRESS_NOT_SET
   CHECKOUT_NOT_FULLY_PAID
   GRAPHQL_ERROR

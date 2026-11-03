@@ -13,7 +13,11 @@ from .....core.models import EventDelivery
 from .....product.models import ProductChannelListing, ProductVariantChannelListing
 from .....webhook.event_types import WebhookEventAsyncType
 from ....core.utils import to_global_id_or_none
-from ....tests.utils import assert_no_permission, get_graphql_content
+from ....tests.utils import (
+    assert_no_permission,
+    get_graphql_content,
+    get_graphql_content_from_response,
+)
 
 MUTATION_CHECKOUT_CUSTOMER_ATTACH = """
     mutation checkoutCustomerAttach($id: ID, $customerId: ID) {
@@ -236,25 +240,54 @@ def test_checkout_customer_attach_by_app_without_permission(
     assert_no_permission(response)
 
 
+def test_checkout_customer_attach_same_customer_to_checkout_with_user(
+    user_api_client, customer_user, user_checkout
+):
+    checkout = user_checkout
+    previous_last_change = checkout.last_change
+
+    variables = {"id": to_global_id_or_none(checkout)}
+
+    response = user_api_client.post_graphql(
+        MUTATION_CHECKOUT_CUSTOMER_ATTACH, variables
+    )
+    content = get_graphql_content(response)
+
+    data = content["data"]["checkoutCustomerAttach"]
+    assert not data["errors"]
+    assert data["checkout"]["token"] == str(checkout.token)
+    checkout.refresh_from_db()
+    assert checkout.user == customer_user
+    assert checkout.last_change == previous_last_change
+
+
+def test_checkout_customer_attach_different_customer_to_checkout_with_user(
+    user2_api_client, customer_user, customer_user2, user_checkout
+):
+    checkout = user_checkout
+    assert checkout.user == customer_user
+
+    customer_id = graphene.Node.to_global_id("User", customer_user2.pk)
+    variables = {"id": to_global_id_or_none(checkout), "customerId": customer_id}
+
+    response = user2_api_client.post_graphql(
+        MUTATION_CHECKOUT_CUSTOMER_ATTACH, variables
+    )
+    content = get_graphql_content(response)
+
+    data = content["data"]["checkoutCustomerAttach"]
+    assert len(data["errors"]) == 1
+    assert data["checkout"] is None
+    assert data["errors"][0]["code"] == CheckoutErrorCode.ALREADY_ATTACHED.name
+    checkout.refresh_from_db()
+    assert checkout.user == customer_user
+
+
 def test_checkout_customer_attach_user_to_checkout_with_user(
     user_api_client, customer_user, user_checkout, address
 ):
     checkout = user_checkout
-
-    query = """
-    mutation checkoutCustomerAttach($id: ID) {
-        checkoutCustomerAttach(id: $id) {
-            checkout {
-                token
-            }
-            errors {
-                field
-                message
-                code
-            }
-        }
-    }
-"""
+    assert checkout.user == customer_user
 
     default_address = address.get_copy()
     second_user = dangerously_create_test_user(
@@ -269,8 +302,12 @@ def test_checkout_customer_attach_user_to_checkout_with_user(
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
     customer_id = graphene.Node.to_global_id("User", second_user.pk)
     variables = {"id": checkout_id, "customerId": customer_id}
-    response = user_api_client.post_graphql(query, variables)
+    response = user_api_client.post_graphql(
+        MUTATION_CHECKOUT_CUSTOMER_ATTACH, variables
+    )
     assert_no_permission(response)
+    checkout.refresh_from_db()
+    assert checkout.user == customer_user
 
 
 def test_with_active_problems_flow(user_api_client, checkout_with_problems):

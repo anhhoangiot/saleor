@@ -2,6 +2,7 @@ from enum import Enum
 
 
 class CheckoutErrorCode(Enum):
+    ALREADY_ATTACHED = "already_attached"
     BILLING_ADDRESS_NOT_SET = "billing_address_not_set"
     CHECKOUT_NOT_FULLY_PAID = "checkout_not_fully_paid"
     GRAPHQL_ERROR = "graphql_error"
