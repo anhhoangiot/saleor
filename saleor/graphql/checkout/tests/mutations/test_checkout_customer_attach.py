@@ -237,13 +237,14 @@ def test_checkout_customer_attach_by_app_without_permission(
 
 
 def test_checkout_customer_attach_user_to_checkout_with_user(
-    user_api_client, customer_user, user_checkout, address
+    user_api_client, customer_user, user_checkout, address,
+    permission_impersonate_user,
 ):
     checkout = user_checkout
 
     query = """
-    mutation checkoutCustomerAttach($id: ID) {
-        checkoutCustomerAttach(id: $id) {
+    mutation checkoutCustomerAttach($id: ID, $customerId: ID) {
+        checkoutCustomerAttach(id: $id, customerId: $customerId) {
             checkout {
                 token
             }
@@ -269,8 +270,62 @@ def test_checkout_customer_attach_user_to_checkout_with_user(
     checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
     customer_id = graphene.Node.to_global_id("User", second_user.pk)
     variables = {"id": checkout_id, "customerId": customer_id}
-    response = user_api_client.post_graphql(query, variables)
-    assert_no_permission(response)
+    response = user_api_client.post_graphql(
+        query, variables, permissions=[permission_impersonate_user]
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["checkoutCustomerAttach"]
+    assert len(data["errors"]) == 1
+    assert data["errors"][0]["code"] == CheckoutErrorCode.CHECKOUT_ALREADY_ATTACHED.name
+    assert not data["checkout"]
+    checkout.refresh_from_db()
+    assert checkout.user == customer_user
+    assert second_user != checkout.user
+
+
+def test_checkout_customer_attach_same_customer_is_idempotent(
+    user_api_client, user_checkout, customer_user
+):
+    """Re-attaching the already-attached customer returns the checkout, no error."""
+    checkout = user_checkout
+    assert checkout.user == customer_user
+    previous_last_change = checkout.last_change
+
+    variables = {"id": to_global_id_or_none(checkout)}
+
+    response = user_api_client.post_graphql(
+        MUTATION_CHECKOUT_CUSTOMER_ATTACH, variables
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["checkoutCustomerAttach"]
+    assert not data["errors"]
+    assert data["checkout"]["email"] == customer_user.email
+    checkout.refresh_from_db()
+    assert checkout.user == customer_user
+    assert checkout.last_change == previous_last_change
+
+
+def test_checkout_customer_attach_same_customer_with_customer_id_is_idempotent(
+    user_api_client, user_checkout, customer_user
+):
+    """Re-attaching via explicit customerId equal to the attached user is a no-op."""
+    checkout = user_checkout
+    assert checkout.user == customer_user
+    previous_last_change = checkout.last_change
+
+    customer_id = graphene.Node.to_global_id("User", customer_user.pk)
+    variables = {"id": to_global_id_or_none(checkout), "customerId": customer_id}
+
+    response = user_api_client.post_graphql(
+        MUTATION_CHECKOUT_CUSTOMER_ATTACH, variables
+    )
+    content = get_graphql_content(response)
+    data = content["data"]["checkoutCustomerAttach"]
+    assert not data["errors"]
+    assert data["checkout"]["email"] == customer_user.email
+    checkout.refresh_from_db()
+    assert checkout.user == customer_user
+    assert checkout.last_change == previous_last_change
 
 
 def test_with_active_problems_flow(user_api_client, checkout_with_problems):
