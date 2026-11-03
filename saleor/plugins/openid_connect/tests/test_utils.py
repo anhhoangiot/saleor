@@ -1,3 +1,4 @@
+import base64
 import datetime
 import json
 import time
@@ -8,7 +9,10 @@ from unittest.mock import MagicMock, Mock, call, patch
 
 import pytest
 import requests
-from authlib.jose import JWTClaims
+from authlib.jose import JsonWebSignature, jwt as authlib_jwt
+from authlib.jose.errors import JoseError
+from cryptography.hazmat.primitives import serialization
+from django.conf import settings
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from freezegun import freeze_time
@@ -18,6 +22,7 @@ from requests_hardened import HTTPSession
 from ....account.models import Group, User
 from ....account.search import update_user_search_vector
 from ....core.jwt import (
+    JWT_ACCESS_TYPE,
     JWT_REFRESH_TYPE,
     PERMISSIONS_FIELD,
     create_access_token,
@@ -39,7 +44,6 @@ from ..utils import (
     create_tokens_from_oauth_payload,
     decode_access_token,
     fetch_jwks,
-    get_domain_from_email,
     get_or_create_user_from_payload,
     get_saleor_permission_names,
     get_saleor_permissions_qs_from_scope,
@@ -52,6 +56,12 @@ from ..utils import (
 )
 
 OIDC_CACHE_TIMEOUT = min(JWKS_CACHE_TIME, OIDC_DEFAULT_CACHE_TIME)
+RSA_PUBLIC_KEY_PEM = serialization.load_pem_private_key(
+    settings.RSA_PRIVATE_KEY.encode(), password=None
+).public_key().public_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+)
 
 
 @pytest.mark.parametrize(
@@ -1572,3 +1582,65 @@ def test_get_or_create_user_from_payload_assigns_default_customer_type(
     # then
     assert created is True
     assert user_from_payload.customer_type == default_customer_type
+
+
+@pytest.mark.parametrize(
+    ("_case", "signing_key"),
+    [
+        ("empty_key", b""),
+        ("prefixed_public_key_pem", b"\n" + RSA_PUBLIC_KEY_PEM),
+        (
+            "public_key_pem_with_leading_comment",
+            b"# comment\n" + RSA_PUBLIC_KEY_PEM,
+        ),
+        (
+            "public_key_pem_with_bom",
+            "\ufeff".encode() + RSA_PUBLIC_KEY_PEM,
+        ),
+    ],
+)
+def test_jwt_signing_rejects_unsafe_hmac_keys(_case, signing_key):
+    """Regression test for the authlib advisories fixed in 1.9.x.
+
+    GHSA-8m4g-j4wp-wgcg: an empty HMAC key allowed forging HS256/384/512 JWS.
+    GHSA-7vr2-2fgp-9w7p: PEM public key material with a leading whitespace
+    prefix, comment or byte-order mark could be used as an HMAC key. The
+    attacker knows the public key bytes, so they could sign any payload with
+    it. Both `authlib.jose.jwt.encode` and `jwt.decode` must refuse such keys.
+    """
+    # when/then - signing refuses the unsafe key instead of producing a
+    # forged HS256 token
+    with pytest.raises((JoseError, ValueError)):
+        authlib_jwt.encode(
+            {"alg": "HS256", "typ": "JWT"},
+            {"email": "attacker@example.com", "sub": "attacker-sub"},
+            key=signing_key,
+        )
+
+    # and verifying refuses it too, if a token signed with it arrives from
+    # elsewhere
+    with pytest.raises((JoseError, ValueError)):
+        authlib_jwt.decode(
+            "a.b.c",
+            key=signing_key,
+        )
+
+
+def test_jws_deserialization_rejects_empty_signatures_list():
+    """Regression test for GHSA-6v38-4h7w-rj9h.
+
+    `JsonWebSignature.deserialize_json` used to accept a JWS JSON
+    Serialization with an empty "signatures" list and return the payload as
+    verified without any signature check. It must raise instead.
+    """
+    # given
+    attacker_payload = {"email": "attacker@example.com", "sub": "attacker-sub"}
+    payload_segment = base64.urlsafe_b64encode(
+        json.dumps(attacker_payload).encode()
+    ).rstrip(b"=").decode()
+    jws_json = json.dumps({"payload": payload_segment, "signatures": []})
+
+    # when/then - deserialization raises instead of returning the payload
+    # as verified
+    with pytest.raises((JoseError, ValueError)):
+        JsonWebSignature().deserialize_json(jws_json, key=b"secret")
