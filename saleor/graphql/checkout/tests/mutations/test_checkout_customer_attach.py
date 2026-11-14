@@ -6,7 +6,6 @@ from django.test import override_settings
 from django.utils import timezone
 from freezegun import freeze_time
 
-from .....account.tests.fixtures.user import dangerously_create_test_user
 from .....checkout.actions import call_checkout_event
 from .....checkout.error_codes import CheckoutErrorCode
 from .....core.models import EventDelivery
@@ -237,40 +236,90 @@ def test_checkout_customer_attach_by_app_without_permission(
 
 
 def test_checkout_customer_attach_user_to_checkout_with_user(
-    user_api_client, customer_user, user_checkout, address
+    user2_api_client, customer_user, customer_user2, user_checkout
 ):
+    # given
     checkout = user_checkout
+    assert checkout.user == customer_user
 
-    query = """
-    mutation checkoutCustomerAttach($id: ID) {
-        checkoutCustomerAttach(id: $id) {
-            checkout {
-                token
-            }
-            errors {
-                field
-                message
-                code
-            }
-        }
-    }
-"""
+    query = MUTATION_CHECKOUT_CUSTOMER_ATTACH
+    customer_id = graphene.Node.to_global_id("User", customer_user2.pk)
+    variables = {"id": to_global_id_or_none(checkout), "customerId": customer_id}
 
-    default_address = address.get_copy()
-    second_user = dangerously_create_test_user(
-        "test2@example.com",
-        "password",
-        default_billing_address=default_address,
-        default_shipping_address=default_address,
-        first_name="Test2",
-        last_name="Tested",
+    # when
+    response = user2_api_client.post_graphql(query, variables)
+
+    # then
+    content = get_graphql_content(response, ignore_errors=True)
+    data = content["data"]["checkoutCustomerAttach"]
+    assert len(data["errors"]) == 1
+    assert data["errors"][0]["code"] == CheckoutErrorCode.CHECKOUT_ALREADY_ASSIGNED.name
+    assert data["errors"][0]["message"] == (
+        "You cannot reassign a checkout that is already attached to a user."
+    )
+    assert not data["checkout"]
+    checkout.refresh_from_db()
+    assert checkout.user == customer_user
+
+
+def test_checkout_customer_attach_the_same_customer(
+    user2_api_client, customer_user2, checkout_with_item
+):
+    # given
+    checkout = checkout_with_item
+    assert checkout.user is None
+
+    query = MUTATION_CHECKOUT_CUSTOMER_ATTACH
+    customer_id = graphene.Node.to_global_id("User", customer_user2.pk)
+    variables = {"id": to_global_id_or_none(checkout), "customerId": customer_id}
+
+    # first attach
+    response = user2_api_client.post_graphql(query, variables)
+    content = get_graphql_content(response)
+    data = content["data"]["checkoutCustomerAttach"]
+    assert not data["errors"]
+    checkout.refresh_from_db()
+    assert checkout.user == customer_user2
+
+    # when: reattach the same customer
+    response = user2_api_client.post_graphql(query, variables)
+
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["checkoutCustomerAttach"]
+    assert not data["errors"]
+    assert data["checkout"]["token"] == str(checkout.token)
+    assert data["checkout"]["email"] == customer_user2.email
+    checkout.refresh_from_db()
+    assert checkout.user == customer_user2
+    assert checkout.email == customer_user2.email
+
+
+def test_checkout_customer_attach_the_same_customer_as_app(
+    app_api_client, customer_user, checkout_with_item, permission_impersonate_user
+):
+    # given
+    checkout = checkout_with_item
+    checkout.user = customer_user
+    checkout.email = customer_user.email
+    checkout.save(update_fields=["user", "email"])
+
+    query = MUTATION_CHECKOUT_CUSTOMER_ATTACH
+    customer_id = graphene.Node.to_global_id("User", customer_user.pk)
+    variables = {"id": to_global_id_or_none(checkout), "customerId": customer_id}
+
+    # when
+    response = app_api_client.post_graphql(
+        query, variables, permissions=[permission_impersonate_user]
     )
 
-    checkout_id = graphene.Node.to_global_id("Checkout", checkout.pk)
-    customer_id = graphene.Node.to_global_id("User", second_user.pk)
-    variables = {"id": checkout_id, "customerId": customer_id}
-    response = user_api_client.post_graphql(query, variables)
-    assert_no_permission(response)
+    # then
+    content = get_graphql_content(response)
+    data = content["data"]["checkoutCustomerAttach"]
+    assert not data["errors"]
+    assert data["checkout"]["token"] == str(checkout.token)
+    checkout.refresh_from_db()
+    assert checkout.user == customer_user
 
 
 def test_with_active_problems_flow(user_api_client, checkout_with_problems):
