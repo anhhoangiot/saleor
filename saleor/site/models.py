@@ -22,6 +22,11 @@ patch_contrib_sites()
 
 DEFAULT_LIMIT_QUANTITY_PER_CHECKOUT: Final[int] = 50
 
+# Hint for the maximum checkout line quantity enforced by
+# `SiteSettings.limit_quantity_per_checkout`; the saleor-dashboard mirrors this
+# value as MAX_LINE_QUANTITY_HINT.
+MAX_LINE_QUANTITY_HINT: Final[int] = 50
+
 
 def email_sender_name_validators():
     return [
